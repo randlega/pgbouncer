@@ -35,6 +35,8 @@
 #include <ares_dns.h>
 #include <arpa/nameser.h>
 #define ZONE_RECHECK 1
+#define addrinfo ares_addrinfo
+#define freeaddrinfo ares_addrinfo
 #else
 /* only c-ares requires this */
 #define impl_per_loop(ctx)
@@ -302,8 +304,8 @@ static bool impl_init(struct DNSContext *ctx)
 	gctx->sev.sigev_notify = SIGEV_SIGNAL;
 	gctx->sev.sigev_signo = SIGALRM;
 
-	evsignal_assign(&gctx->ev, pgb_event_base, SIGALRM, dns_signal, gctx);
-	if (evsignal_add(&gctx->ev, NULL) < 0) {
+	signal_set(&gctx->ev, SIGALRM, dns_signal, gctx);
+	if (signal_add(&gctx->ev, NULL) < 0) {
 		free(gctx);
 		return false;
 	}
@@ -354,7 +356,7 @@ static void impl_release(struct DNSContext *ctx)
 {
 	struct GaiContext *gctx = ctx->edns;
 	if (gctx) {
-		evsignal_del(&gctx->ev);
+		signal_del(&gctx->ev);
 		free(gctx);
 		ctx->edns = NULL;
 	}
@@ -396,7 +398,7 @@ static bool impl_init(struct DNSContext *ctx)
 	if (cf_resolv_conf && cf_resolv_conf[0]) {
 		int err;
 
-		ctx->edns = evdns_base_new(pgb_event_base, 0);
+		ctx->edns = evdns_base_new(NULL, 0);
 		if (!ctx->edns) {
 			log_error("evdns_base_new failed");
 			return false;
@@ -410,7 +412,7 @@ static bool impl_init(struct DNSContext *ctx)
 			return false;
 		}
 	} else {
-		ctx->edns = evdns_base_new(pgb_event_base, 1);
+		ctx->edns = evdns_base_new(NULL, 1);
 		if (!ctx->edns) {
 			log_error("evdns_base_new failed");
 			return false;
@@ -561,13 +563,13 @@ static bool impl_init(struct DNSContext *ctx)
 		log_error("dns_open failed: fd=%d", fd);
 		return false;
 	}
-	event_assign(&udns->ev_io, pgb_event_base, fd, EV_READ | EV_PERSIST, udns_io_cb, ctx);
+	event_set(&udns->ev_io, fd, EV_READ | EV_PERSIST, udns_io_cb, ctx);
 	err = event_add(&udns->ev_io, NULL);
 	if (err < 0)
 		log_warning("impl_init: event_add failed: %s", strerror(errno));
 
 	/* timer setup */
-	evtimer_assign(&udns->ev_timer, pgb_event_base, udns_timer_cb, ctx);
+	evtimer_set(&udns->ev_timer, udns_timer_cb, ctx);
 	dns_set_tmcbck(udns->ctx, udns_timer_setter, ctx);
 
 	return true;
@@ -857,7 +859,7 @@ re_set:
 		event_del(&xfd->ev);
 	xfd->wait = new_wait;
 	if (new_wait) {
-		event_assign(&xfd->ev, pgb_event_base, sock, new_wait | EV_PERSIST, xares_fd_cb, xfd);
+		event_set(&xfd->ev, sock, new_wait | EV_PERSIST, xares_fd_cb, xfd);
 		if (event_add(&xfd->ev, NULL) < 0)
 			log_warning("adns: event_add failed: %s", strerror(errno));
 	} else {
@@ -867,7 +869,7 @@ re_set:
 }
 
 /* called by c-ares on dns reply */
-static void xares_host_cb(void *arg, int status, int timeouts, struct hostent *h)
+/*static void xares_host_cb(void *arg, int status, int timeouts, struct hostent *h)
 {
 	struct DNSRequest *req = arg;
 	struct addrinfo *res = NULL;
@@ -880,6 +882,17 @@ static void xares_host_cb(void *arg, int status, int timeouts, struct hostent *h
 		log_debug("DNS lookup failed: %s - %s", req->name, ares_strerror(status));
 		got_result_gai(0, res, req);
 	}
+	}*/
+/* called by c-ares on dns reply */
+static void xares_host_cb(void *arg, int status,int timeouts, struct ares_addrinfo *result)
+{
+  // Check that lookup was successfull
+  if (status != ARES_SUCCESS){
+    log_noise("Lookup failed.");
+  }
+
+  //TODO(GARRETT)
+  
 }
 
 /* send hostname query */
@@ -887,7 +900,7 @@ static void impl_launch_query(struct DNSRequest *req)
 {
 	struct XaresMeta *meta = req->ctx->edns;
 	int af;
-
+        struct ares_getaddrinfo hints;
 /*
  * c-ares <= 1.10 cannot resolve CNAME with AF_UNSPEC.
  *
@@ -900,11 +913,23 @@ static void impl_launch_query(struct DNSRequest *req)
 #warning c-ares <=1.10 has buggy IPv6 support; this PgBouncer build will use IPv4 only.
 	af = AF_INET;
 #else
-	af = AF_UNSPEC;
+        hints.ai_family = AF_UNSPEC;
+	hints.ai_flags = 0;
+	hints.ai_socktype = 0;
+	hints.ai_protocol = 0;
+	//	af = AF_UNSPEC;
 #endif
-	log_noise("dns: ares_gethostbyname(%s)", req->name);
-	ares_gethostbyname(meta->chan, req->name, af, xares_host_cb, req);
-
+	log_noise("dns: ares_getaddrinfo(%s)", req->name);
+	
+	
+       
+	//	ares_gethostbyname(meta->chan, req->name, af, xares_host_cb, req);
+        ares_getaddrinfo(meta->chan,
+			 req->name,
+			 // figure out what a service is,
+			 hints,
+			 // need to make callback,
+			 req);
 	meta->got_events = 1;
 }
 
@@ -975,7 +1000,7 @@ static bool impl_init(struct DNSContext *ctx)
 
 	ares_set_socket_callback(meta->chan, xares_new_socket_cb, ctx);
 
-	evtimer_assign(&meta->ev_timer, pgb_event_base, xares_timer_cb, ctx);
+	evtimer_set(&meta->ev_timer, xares_timer_cb, ctx);
 
 	ctx->edns = meta;
 	return true;
@@ -1415,7 +1440,7 @@ static void got_result_gai(int result, struct addrinfo *res, void *arg)
 		req->res_ttl = get_cached_time() + cf_dns_max_ttl;
 	} else {
 		/* lookup failed */
-		log_warning("DNS lookup failed: %s: result=%d", req->name, result);
+		log_warning("lookup failed: %s: result=%d", req->name, result);
 		req->res_ttl = get_cached_time() + cf_dns_nxdomain_ttl;
 	}
 
@@ -1538,7 +1563,7 @@ static void launch_zone_timer(struct DNSContext *ctx)
 	tv.tv_sec = cf_dns_zone_check_period / USEC;
 	tv.tv_usec = cf_dns_zone_check_period % USEC;
 
-	evtimer_assign(&ctx->ev_zone_timer, pgb_event_base, zone_timer, ctx);
+	evtimer_set(&ctx->ev_zone_timer, zone_timer, ctx);
 	safe_evtimer_add(&ctx->ev_zone_timer, &tv);
 
 	ctx->zone_state = 2;
